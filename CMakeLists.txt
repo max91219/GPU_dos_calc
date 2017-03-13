@@ -5,7 +5,7 @@ project(CUDA_DOS)
 find_package(CUDA)
 find_package(Boost COMPONENTS program_options REQUIRED)
 
-list(APPEND CUDA_NVCC_FLAGS "-arch=sm_52;-std=c++11;-O2;-DVERBOSE")
+list(APPEND CUDA_NVCC_FLAGS "-arch=sm_52;-std=c++11;-O3;")
 SET(CUDA_PROPAGATE_HOST_FLAGS OFF)
 
 CUDA_ADD_EXECUTABLE(DOS_CALC main.cu)

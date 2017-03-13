@@ -1,8 +1,43 @@
-#include <boost/program_options.hpp>
-#include <curand_kernel.h>
-#include <iostream>
-#include <fstream>
+#include<boost/program_options.hpp>
+#include<iostream>
+#include<fstream>
+#include<vector>
 
+#include<curand_kernel.h>
+
+#define THREADS_PER_BLOCK 1024
+#define NUM_BLOCKS 22
+
+//Useful for checking return values of cuda API calls
+#define gpu_error_check(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+  if (code != cudaSuccess) {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+    }
+}
+
+//Define the kernels and device functions
+__device__ int get_global_id() {
+  return blockIdx.x *blockDim.x + threadIdx.x;
+}
+
+__global__ void set_up_rngs(curandState *state) {
+  int id = get_global_id();
+
+  curand_init(1337, id, 0, &state[id]);
+}
+
+__global__ void gen_uniform(curandState *state, float *results) {
+  int id = get_global_id();
+
+  curandState local_state = state[id];
+  results[id] = curand_uniform(&local_state);
+
+  state[id] = local_state;
+}
+
+//Main control flow of code
 int main(int argc, char* argv[]) {
 
   // Set up the program options
@@ -44,6 +79,35 @@ int main(int argc, char* argv[]) {
   std::cout << "o_file: " << o_file << std::endl;
   std::cout << "d_eps: " << d_eps << std::endl;
 
+  std::vector<float> results_h(NUM_BLOCKS * THREADS_PER_BLOCK);
+
+  //initialise cuda stuff
+  curandState *dev_states;
+  float *res_d;
+
+  //Allocate memory on the device
+  gpu_error_check(cudaMalloc((void **)&dev_states,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(curandState)));
+  gpu_error_check(cudaMalloc((void **)&res_d,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(float)));
+
+  //Print out lauch params
+  std::cout << "launching " << NUM_BLOCKS << " of " << THREADS_PER_BLOCK << " threads" << std::endl;
+
+  //initialise the rng states on the gpu
+  set_up_rngs <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (dev_states);
+  gpu_error_check(cudaPeekAtLastError());
+
+  //generate random numbers
+  gen_uniform <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (dev_states, res_d);
+  gpu_error_check(cudaPeekAtLastError());
+
+  //copy results back
+  gpu_error_check(cudaMemcpy(results_h.data(), res_d, NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(float), cudaMemcpyDeviceToHost));
+
+  for (float f : results_h) std::cout << f << std::endl;
+
+  //free device memory
+  gpu_error_check(cudaFree(dev_states));
+  gpu_error_check(cudaFree(res_d));
 
   // std::ofstream ofile;
   // ofile.open(o_file.c_str());
