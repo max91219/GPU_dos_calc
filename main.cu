@@ -4,8 +4,10 @@
 #include<vector>
 #include<cmath>
 
+//CUDA includes
 #include<curand_kernel.h>
 
+//Launch params
 #define THREADS_PER_BLOCK 1024
 #define NUM_BLOCKS 22
 
@@ -27,10 +29,9 @@ __device__ int get_local_id() {
   return threadIdx.x + threadIdx.y * blockDim.x;
 }
 
-__global__ void set_up_rngs(curandState *state) {
+__global__ void set_up_rngs(curandState *state, unsigned int *seeds) {
   int id = get_global_id();
-
-  curand_init(id, 0, 0, &state[id]);
+  curand_init(seeds[id], 0, 0, &state[id]);
 }
 
 __device__ float calc_dispersion(float kx, float ky, float kz) {
@@ -85,13 +86,32 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
 
   while (g_bin_id < bins) {
 
-    float val = (float)l_hist[g_bin_id] / (float)(samples*THREADS_PER_BLOCK);
+    float val = (float)l_hist[g_bin_id] / (float)(samples * (float) THREADS_PER_BLOCK);
     atomicAdd(&global_hist[g_bin_id],val);
 
     //keep shifting the block untill we have added all the bins
     g_bin_id += blockDim.x;
   }
 
+}
+
+unsigned int good_seed(int thread_id) {
+  unsigned int random_seed, random_seed_a, random_seed_b;
+
+  std::ifstream file ("/dev/urandom", std::ios::binary);
+  if (file.is_open()) {
+    char * memblock;
+    int size = sizeof(int);
+    memblock = new char [size];
+    file.read (memblock, size);
+    file.close();
+    random_seed_a = *reinterpret_cast<int*>(memblock);
+    delete[] memblock;
+  }
+
+  random_seed_b = std::time(0);
+  random_seed = random_seed_a xor random_seed_b xor thread_id;
+  return random_seed;
 }
 
 //Main control flow of code
@@ -136,16 +156,37 @@ int main(int argc, char* argv[]) {
   std::cout << "o_file: " << o_file << std::endl;
   std::cout << "d_eps: " << d_eps << std::endl;
   std::cout << "1/d_eps: " << 1.0/d_eps << std::endl;
+  std::cout << "Total number of samples: " << n*(float)(NUM_BLOCKS * THREADS_PER_BLOCK) << std::endl;
 
   std::vector<float> h_hist(N);
+  std::vector<unsigned int> rng_seeds(NUM_BLOCKS * THREADS_PER_BLOCK);
 
   //initialise cuda stuff
   curandState *d_states;
   unsigned int *d_local_hist;
   float *d_global_hist;
+  unsigned int *d_seeds;
 
-  //Allocate memory on the device
+  //Generate the seeds
+  std::cout << "Generating Seeds" << std::endl;
+  for (int i = 0; i<rng_seeds.size(); i++) rng_seeds[i] = good_seed(i);
+
+  //allocate states and seeds and copy the seeds to the device
   gpu_error_check(cudaMalloc((void **)&d_states,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(curandState)));
+  gpu_error_check(cudaMalloc(&d_seeds, NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(unsigned int)));
+  gpu_error_check(cudaMemcpy(rng_seeds.data(), d_seeds, NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+  //Print out lauch params
+  std::cout << "launching " << NUM_BLOCKS << " blocks of " << THREADS_PER_BLOCK << " threads" << std::endl;
+
+  //initialise the rng states on the gpu
+  set_up_rngs <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states, d_seeds);
+  gpu_error_check(cudaPeekAtLastError());
+
+  //Free the seeds on the device
+  gpu_error_check(cudaFree(d_seeds));
+
+  //Allocate memory on the device for local and global histograms
   gpu_error_check(cudaMalloc(&d_local_hist, NUM_BLOCKS * N * sizeof(unsigned int)));
   gpu_error_check(cudaMalloc(&d_global_hist, N * sizeof(float)));
 
@@ -153,14 +194,8 @@ int main(int argc, char* argv[]) {
   gpu_error_check(cudaMemset(d_local_hist, (unsigned int) 0, NUM_BLOCKS * N * sizeof(unsigned int)));
   gpu_error_check(cudaMemset(d_global_hist, (float) 0, N * sizeof(unsigned int)));
 
-  //Print out lauch params
-  std::cout << "launching " << NUM_BLOCKS << " of " << THREADS_PER_BLOCK << " threads" << std::endl;
-
-  //initialise the rng states on the gpu
-  set_up_rngs <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states);
-  gpu_error_check(cudaPeekAtLastError());
-
   //generate the histograms
+  std::cout << "Generating histogram" << std::endl;
   gen_disp_histogram <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states, d_local_hist, d_global_hist, n, N, lower_band_edge, d_eps);
   gpu_error_check(cudaDeviceSynchronize());
   gpu_error_check(cudaPeekAtLastError());
@@ -168,18 +203,17 @@ int main(int argc, char* argv[]) {
   //Copy then results back
   gpu_error_check(cudaMemcpy(h_hist.data(), d_global_hist, N * sizeof(float), cudaMemcpyDeviceToHost));
 
-  //for (float f : h_hist) std::cout << f/d_eps << std::endl;
-
   //free device memory
   gpu_error_check(cudaFree(d_states));
   gpu_error_check(cudaFree(d_local_hist));
   gpu_error_check(cudaFree(d_global_hist));
 
+  std::cout << "Writing to file" << std::endl;
   std::ofstream ofile;
   ofile.open(o_file.c_str());
   if (ofile.is_open()){
     for (int i = 0; i < h_hist.size(); i++){
-      ofile << (i*d_eps)+lower_band_edge << " " << h_hist[i]/d_eps << std::endl;
+      ofile << (i*d_eps)+lower_band_edge << " " << h_hist[i]/((float)NUM_BLOCKS * d_eps) << std::endl;
     }
 
     ofile.close();
