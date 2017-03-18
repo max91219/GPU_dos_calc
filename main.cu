@@ -20,7 +20,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 //Define the kernels and device functions
 __device__ int get_global_id() {
-  return blockIdx.x *blockDim.x + threadIdx.x;
+  return blockIdx.x * blockDim.x + threadIdx.x;
 }
 
 __device__ int get_local_id() {
@@ -66,6 +66,11 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
     atomicAdd(&l_hist[bin_ind],1);
   }
 
+  //Make sure that all the threads have finished sampling before we
+  //add up the global histogram
+  __syncthreads();
+
+
   //put the new state back in global memory incase we use it again
   //this stops us generateing the same seqence if we re run the kernel
   state[g_id] = local_state;
@@ -76,7 +81,16 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
   //if we are using alot of samples per thread.
   //minimise this by adding up the bin count times d_eps (small number)
   //not the total bin count as an int
+  int g_bin_id = l_id;
 
+  while (g_bin_id < bins) {
+
+    float val = (float)l_hist[g_bin_id] / (float)(samples*THREADS_PER_BLOCK);
+    atomicAdd(&global_hist[g_bin_id],val);
+
+    //keep shifting the block untill we have added all the bins
+    g_bin_id += blockDim.x;
+  }
 
 }
 
@@ -121,8 +135,9 @@ int main(int argc, char* argv[]) {
   std::cout << "n_sample: " << n << std::endl;
   std::cout << "o_file: " << o_file << std::endl;
   std::cout << "d_eps: " << d_eps << std::endl;
+  std::cout << "1/d_eps: " << 1.0/d_eps << std::endl;
 
-  std::vector<unsigned int> results_h(N);
+  std::vector<float> h_hist(N);
 
   //initialise cuda stuff
   curandState *d_states;
@@ -136,6 +151,7 @@ int main(int argc, char* argv[]) {
 
   //Set the histograms to zero to start
   gpu_error_check(cudaMemset(d_local_hist, (unsigned int) 0, NUM_BLOCKS * N * sizeof(unsigned int)));
+  gpu_error_check(cudaMemset(d_global_hist, (float) 0, N * sizeof(unsigned int)));
 
   //Print out lauch params
   std::cout << "launching " << NUM_BLOCKS << " of " << THREADS_PER_BLOCK << " threads" << std::endl;
@@ -150,30 +166,24 @@ int main(int argc, char* argv[]) {
   gpu_error_check(cudaPeekAtLastError());
 
   //Copy then results back
-  gpu_error_check(cudaMemcpy(results_h.data(), d_global_hist, N * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+  gpu_error_check(cudaMemcpy(h_hist.data(), d_global_hist, N * sizeof(float), cudaMemcpyDeviceToHost));
 
-  for (float f : results_h) std::cout << f << std::endl;
+  //for (float f : h_hist) std::cout << f/d_eps << std::endl;
 
   //free device memory
   gpu_error_check(cudaFree(d_states));
   gpu_error_check(cudaFree(d_local_hist));
   gpu_error_check(cudaFree(d_global_hist));
 
-  // std::ofstream ofile;
-  // ofile.open(o_file.c_str());
-  // if (ofile.is_open()){
+  std::ofstream ofile;
+  ofile.open(o_file.c_str());
+  if (ofile.is_open()){
+    for (int i = 0; i < h_hist.size(); i++){
+      ofile << (i*d_eps)+lower_band_edge << " " << h_hist[i]/d_eps << std::endl;
+    }
 
-  //   float val;
-
-  //   for (int i = 0; i < results_h.size(); i++){
-  //     val = results_h[i];
-  //     val *= 1.0f/d_eps;
-  //     val /= n;
-  //     ofile << (i*d_eps)+lower_band_edge << " " << val << std::endl;
-  //   }
-
-  //   ofile.close();
-  // }
+    ofile.close();
+  }
 
 
   return 0;
