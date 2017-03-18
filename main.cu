@@ -2,6 +2,7 @@
 #include<iostream>
 #include<fstream>
 #include<vector>
+#include<cmath>
 
 #include<curand_kernel.h>
 
@@ -22,19 +23,61 @@ __device__ int get_global_id() {
   return blockIdx.x *blockDim.x + threadIdx.x;
 }
 
+__device__ int get_local_id() {
+  return threadIdx.x + threadIdx.y * blockDim.x;
+}
+
 __global__ void set_up_rngs(curandState *state) {
   int id = get_global_id();
 
-  curand_init(1337, id, 0, &state[id]);
+  curand_init(id, 0, 0, &state[id]);
 }
 
-__global__ void gen_uniform(curandState *state, float *results) {
-  int id = get_global_id();
+__device__ float calc_dispersion(float kx, float ky, float kz) {
+  return -4.0f * ((std::cos(kx/2.0f)*std::cos(ky/2.0f)) +
+                  (std::cos(kz/2.0f)*std::cos(ky/2.0f)) +
+                  (std::cos(kx/2.0f)*std::cos(kz/2.0f))) -
+    2.0 * 0.25 * (std::cos(kx) +
+                  std::cos(ky) +
+                  std::cos(kz));
+}
 
-  curandState local_state = state[id];
-  results[id] = curand_uniform(&local_state);
+__global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist, float* global_hist, int samples, int bins, float lbe, float d_eps) {
+  int g_id = get_global_id();
+  int l_id = get_local_id();
 
-  state[id] = local_state;
+  //copy state from global memory into local memory for faster access
+  curandState local_state = state[g_id];
+
+  //calculate where this thread blocks histogram starts
+  unsigned int *l_hist = local_hist + blockIdx.x * bins;
+
+  float kx, ky, kz;
+  unsigned int bin_ind;
+
+  for(int s = 0; s < samples; s++) {
+    kx = curand_uniform(&local_state) * 2.0f * M_PI;
+    ky = curand_uniform(&local_state) * 2.0f * M_PI;
+    kz = curand_uniform(&local_state) * 2.0f * M_PI;
+
+    bin_ind = (unsigned int) floor(((calc_dispersion(kx, ky, kz) - lbe)/d_eps));
+
+    //Stops collisions when adding to block histogram
+    atomicAdd(&l_hist[bin_ind],1);
+  }
+
+  //put the new state back in global memory incase we use it again
+  //this stops us generateing the same seqence if we re run the kernel
+  state[g_id] = local_state;
+
+  //Now we are done generateing the local histogram we can fold it into
+  //one global histogram from all the blocks.
+  //We will need to be careful here of integer and float overflow
+  //if we are using alot of samples per thread.
+  //minimise this by adding up the bin count times d_eps (small number)
+  //not the total bin count as an int
+
+
 }
 
 //Main control flow of code
@@ -79,35 +122,42 @@ int main(int argc, char* argv[]) {
   std::cout << "o_file: " << o_file << std::endl;
   std::cout << "d_eps: " << d_eps << std::endl;
 
-  std::vector<float> results_h(NUM_BLOCKS * THREADS_PER_BLOCK);
+  std::vector<unsigned int> results_h(N);
 
   //initialise cuda stuff
-  curandState *dev_states;
-  float *res_d;
+  curandState *d_states;
+  unsigned int *d_local_hist;
+  float *d_global_hist;
 
   //Allocate memory on the device
-  gpu_error_check(cudaMalloc((void **)&dev_states,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(curandState)));
-  gpu_error_check(cudaMalloc((void **)&res_d,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(float)));
+  gpu_error_check(cudaMalloc((void **)&d_states,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(curandState)));
+  gpu_error_check(cudaMalloc(&d_local_hist, NUM_BLOCKS * N * sizeof(unsigned int)));
+  gpu_error_check(cudaMalloc(&d_global_hist, N * sizeof(float)));
+
+  //Set the histograms to zero to start
+  gpu_error_check(cudaMemset(d_local_hist, (unsigned int) 0, NUM_BLOCKS * N * sizeof(unsigned int)));
 
   //Print out lauch params
   std::cout << "launching " << NUM_BLOCKS << " of " << THREADS_PER_BLOCK << " threads" << std::endl;
 
   //initialise the rng states on the gpu
-  set_up_rngs <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (dev_states);
+  set_up_rngs <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states);
   gpu_error_check(cudaPeekAtLastError());
 
-  //generate random numbers
-  gen_uniform <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (dev_states, res_d);
+  //generate the histograms
+  gen_disp_histogram <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states, d_local_hist, d_global_hist, n, N, lower_band_edge, d_eps);
+  gpu_error_check(cudaDeviceSynchronize());
   gpu_error_check(cudaPeekAtLastError());
 
-  //copy results back
-  gpu_error_check(cudaMemcpy(results_h.data(), res_d, NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(float), cudaMemcpyDeviceToHost));
+  //Copy then results back
+  gpu_error_check(cudaMemcpy(results_h.data(), d_global_hist, N * sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
   for (float f : results_h) std::cout << f << std::endl;
 
   //free device memory
-  gpu_error_check(cudaFree(dev_states));
-  gpu_error_check(cudaFree(res_d));
+  gpu_error_check(cudaFree(d_states));
+  gpu_error_check(cudaFree(d_local_hist));
+  gpu_error_check(cudaFree(d_global_hist));
 
   // std::ofstream ofile;
   // ofile.open(o_file.c_str());
@@ -115,8 +165,8 @@ int main(int argc, char* argv[]) {
 
   //   float val;
 
-  //   for (int i = 0; i < dos_res.size(); i++){
-  //     val = dos_res[i];
+  //   for (int i = 0; i < results_h.size(); i++){
+  //     val = results_h[i];
   //     val *= 1.0f/d_eps;
   //     val /= n;
   //     ofile << (i*d_eps)+lower_band_edge << " " << val << std::endl;
