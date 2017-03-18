@@ -9,7 +9,7 @@
 
 //Launch params
 #define THREADS_PER_BLOCK 1024
-#define NUM_BLOCKS 22
+#define NUM_BLOCKS 64
 
 //Useful for checking return values of cuda API calls
 #define gpu_error_check(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -122,8 +122,8 @@ int main(int argc, char* argv[]) {
   po::options_description description("Options");
   description.add_options()
     ("o_file,o", po::value<std::string>()->default_value("dos.dat"), "output file name")
-    ("n_sample,n", po::value<int>()->default_value(2000000), "number of samples")
-    ("num_vals,N", po::value<int>()->default_value(200000), "number of points in the epsilon grid");
+    ("n_sample,n", po::value<int>()->default_value(10000000), "number of samples")
+    ("num_vals,N", po::value<int>()->default_value(34000), "number of points in the epsilon grid");
 
   po::variables_map vm;
 
