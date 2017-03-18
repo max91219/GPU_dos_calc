@@ -166,6 +166,9 @@ int main(int argc, char* argv[]) {
   unsigned int *d_local_hist;
   float *d_global_hist;
   unsigned int *d_seeds;
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
 
   //Generate the seeds
   std::cout << "Generating Seeds" << std::endl;
@@ -195,13 +198,24 @@ int main(int argc, char* argv[]) {
   gpu_error_check(cudaMemset(d_global_hist, (float) 0, N * sizeof(unsigned int)));
 
   //generate the histograms
-  std::cout << "Generating histogram" << std::endl;
+  std::cout << "Generating Density of States" << std::endl;
+  cudaEventRecord(start);
   gen_disp_histogram <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states, d_local_hist, d_global_hist, n, N, lower_band_edge, d_eps);
   gpu_error_check(cudaDeviceSynchronize());
   gpu_error_check(cudaPeekAtLastError());
+  cudaEventRecord(stop);
 
   //Copy then results back
   gpu_error_check(cudaMemcpy(h_hist.data(), d_global_hist, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+  cudaEventSynchronize(stop);
+  float milliseconds = 0;
+  cudaEventElapsedTime(&milliseconds, start, stop);
+
+  std::cout << "Sampling took: " << milliseconds/1000.0f << " s" << std::endl;
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
 
   //free device memory
   gpu_error_check(cudaFree(d_states));
