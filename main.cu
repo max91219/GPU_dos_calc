@@ -5,7 +5,9 @@
 #include<cmath>
 
 //CUDA includes
+#include <assert.h>
 #include<curand_kernel.h>
+#include <math_constants.h>
 
 //Launch params
 #define THREADS_PER_BLOCK 1024
@@ -13,11 +15,12 @@
 
 //Useful for checking return values of cuda API calls
 #define gpu_error_check(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
   if (code != cudaSuccess) {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-    }
+    fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    if (abort) exit(code);
+  }
 }
 
 //Define the kernels and device functions
@@ -53,15 +56,23 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
   //calculate where this thread blocks histogram starts
   unsigned int *l_hist = local_hist + blockIdx.x * bins;
 
-  float kx, ky, kz;
+  float kx, ky, kz, disp;
   unsigned int bin_ind;
 
   for(int s = 0; s < samples; s++) {
-    kx = curand_uniform(&local_state) * 2.0f * M_PI;
-    ky = curand_uniform(&local_state) * 2.0f * M_PI;
-    kz = curand_uniform(&local_state) * 2.0f * M_PI;
+    kx = curand_uniform(&local_state) * 2.0f * CUDART_PI_F;
+    ky = curand_uniform(&local_state) * 2.0f * CUDART_PI_F;
+    kz = curand_uniform(&local_state) * 2.0f * CUDART_PI_F;
 
-    bin_ind = (unsigned int) floor(((calc_dispersion(kx, ky, kz) - lbe)/d_eps));
+    //Some asserts to check we are in bounds
+    assert(kx >= 0 && kx <= 2.0f * CUDART_PI_F);
+    assert(ky >= 0 && ky <= 2.0f * CUDART_PI_F);
+    assert(kz >= 0 && kz <= 2.0f * CUDART_PI_F);
+
+    disp = calc_dispersion(kx, ky, kz);
+    assert(disp <= 3.5f && disp >= -13.5f);
+
+    bin_ind = (unsigned int) floor(((disp - lbe) / d_eps));
 
     //Stops collisions when adding to block histogram
     atomicAdd(&l_hist[bin_ind],1);
@@ -86,7 +97,7 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
 
   while (g_bin_id < bins) {
 
-    float val = (float)l_hist[g_bin_id] / (float)(samples * (float) THREADS_PER_BLOCK);
+    float val = (float)l_hist[g_bin_id] / (float)( (float)samples * (float)THREADS_PER_BLOCK);
     atomicAdd(&global_hist[g_bin_id],val);
 
     //keep shifting the block untill we have added all the bins
@@ -195,7 +206,7 @@ int main(int argc, char* argv[]) {
 
   //Set the histograms to zero to start
   gpu_error_check(cudaMemset(d_local_hist, (unsigned int) 0, NUM_BLOCKS * N * sizeof(unsigned int)));
-  gpu_error_check(cudaMemset(d_global_hist, (float) 0, N * sizeof(unsigned int)));
+  gpu_error_check(cudaMemset(d_global_hist, (float) 0, N * sizeof(float)));
 
   //generate the histograms
   std::cout << "Generating Density of States" << std::endl;
