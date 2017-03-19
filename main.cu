@@ -8,10 +8,60 @@
 #include <assert.h>
 #include<curand_kernel.h>
 #include <math_constants.h>
+#include <curand_mtgp32_host.h>
+#include <curand_mtgp32dc_p_11213.h>
 
 //Launch params
-#define THREADS_PER_BLOCK 1024
+#define THREADS_PER_BLOCK 256 //1024
 #define NUM_BLOCKS 64
+
+//Handles errors from curand
+static const char *curandGetErrorString(curandStatus_t error)
+{
+  switch (error)
+    {
+    case CURAND_STATUS_SUCCESS:
+      return "CURAND_STATUS_SUCCESS";
+
+    case CURAND_STATUS_VERSION_MISMATCH:
+      return "CURAND_STATUS_VERSION_MISMATCH";
+
+    case CURAND_STATUS_NOT_INITIALIZED:
+      return "CURAND_STATUS_NOT_INITIALIZED";
+
+    case CURAND_STATUS_ALLOCATION_FAILED:
+      return "CURAND_STATUS_ALLOCATION_FAILED";
+
+    case CURAND_STATUS_TYPE_ERROR:
+      return "CURAND_STATUS_TYPE_ERROR";
+
+    case CURAND_STATUS_OUT_OF_RANGE:
+      return "CURAND_STATUS_OUT_OF_RANGE";
+
+    case CURAND_STATUS_LENGTH_NOT_MULTIPLE:
+      return "CURAND_STATUS_LENGTH_NOT_MULTIPLE";
+
+    case CURAND_STATUS_DOUBLE_PRECISION_REQUIRED:
+      return "CURAND_STATUS_DOUBLE_PRECISION_REQUIRED";
+
+    case CURAND_STATUS_LAUNCH_FAILURE:
+      return "CURAND_STATUS_LAUNCH_FAILURE";
+
+    case CURAND_STATUS_PREEXISTING_FAILURE:
+      return "CURAND_STATUS_PREEXISTING_FAILURE";
+
+    case CURAND_STATUS_INITIALIZATION_FAILED:
+      return "CURAND_STATUS_INITIALIZATION_FAILED";
+
+    case CURAND_STATUS_ARCH_MISMATCH:
+      return "CURAND_STATUS_ARCH_MISMATCH";
+
+    case CURAND_STATUS_INTERNAL_ERROR:
+      return "CURAND_STATUS_INTERNAL_ERROR";
+    }
+
+  return "<unknown>";
+}
 
 //Useful for checking return values of cuda API calls
 #define gpu_error_check(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -21,6 +71,35 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
     if (abort) exit(code);
   }
+}
+
+//Useful for checking return values of CURAND API calls
+#define CURAND_error_check(ans) { curandAssert((ans), __FILE__, __LINE__); }
+
+inline void curandAssert(curandStatus code, const char *file, int line, bool abort=true) {
+  if (code != CURAND_STATUS_SUCCESS) {
+    fprintf(stderr,"CURANDassert: %s %s %d\n", curandGetErrorString(code), file, line);
+    if (abort) exit(code);
+  }
+}
+
+unsigned int good_seed(int thread_id) {
+  unsigned int random_seed, random_seed_a, random_seed_b;
+
+  std::ifstream file ("/dev/urandom", std::ios::binary);
+  if (file.is_open()) {
+    char * memblock;
+    int size = sizeof(int);
+    memblock = new char [size];
+    file.read (memblock, size);
+    file.close();
+    random_seed_a = *reinterpret_cast<int*>(memblock);
+    delete[] memblock;
+  }
+
+  random_seed_b = std::time(0);
+  random_seed = random_seed_a xor random_seed_b xor thread_id;
+  return random_seed;
 }
 
 //Define the kernels and device functions
@@ -46,12 +125,12 @@ __device__ float calc_dispersion(float kx, float ky, float kz) {
                   std::cos(kz));
 }
 
-__global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist, float* global_hist, int samples, int bins, float lbe, float d_eps) {
+__global__ void gen_disp_histogram(curandStateMtgp32 *state, unsigned int *local_hist, float* global_hist, int samples, int bins, float lbe, float d_eps) {
   int g_id = get_global_id();
   int l_id = get_local_id();
 
   //copy state from global memory into local memory for faster access
-  curandState local_state = state[g_id];
+  //curandState local_state = state[g_id];
 
   //calculate where this thread blocks histogram starts
   unsigned int *l_hist = local_hist + blockIdx.x * bins;
@@ -60,9 +139,9 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
   unsigned int bin_ind;
 
   for(int s = 0; s < samples; s++) {
-    kx = curand_uniform(&local_state) * 2.0f * CUDART_PI_F;
-    ky = curand_uniform(&local_state) * 2.0f * CUDART_PI_F;
-    kz = curand_uniform(&local_state) * 2.0f * CUDART_PI_F;
+    kx = curand_uniform(&state[blockIdx.x]) * 2.0f * CUDART_PI_F;
+    ky = curand_uniform(&state[blockIdx.x]) * 2.0f * CUDART_PI_F;
+    kz = curand_uniform(&state[blockIdx.x]) * 2.0f * CUDART_PI_F;
 
     //Some asserts to check we are in bounds
     assert(kx >= 0 && kx <= 2.0f * CUDART_PI_F);
@@ -85,7 +164,7 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
 
   //put the new state back in global memory incase we use it again
   //this stops us generateing the same seqence if we re run the kernel
-  state[g_id] = local_state;
+  //state[g_id] = local_state;
 
   //Now we are done generateing the local histogram we can fold it into
   //one global histogram from all the blocks.
@@ -104,25 +183,6 @@ __global__ void gen_disp_histogram(curandState *state, unsigned int *local_hist,
     g_bin_id += blockDim.x;
   }
 
-}
-
-unsigned int good_seed(int thread_id) {
-  unsigned int random_seed, random_seed_a, random_seed_b;
-
-  std::ifstream file ("/dev/urandom", std::ios::binary);
-  if (file.is_open()) {
-    char * memblock;
-    int size = sizeof(int);
-    memblock = new char [size];
-    file.read (memblock, size);
-    file.close();
-    random_seed_a = *reinterpret_cast<int*>(memblock);
-    delete[] memblock;
-  }
-
-  random_seed_b = std::time(0);
-  random_seed = random_seed_a xor random_seed_b xor thread_id;
-  return random_seed;
 }
 
 //Main control flow of code
@@ -170,39 +230,28 @@ int main(int argc, char* argv[]) {
   std::cout << "Total number of samples: " << n*(float)(NUM_BLOCKS * THREADS_PER_BLOCK) << std::endl;
 
   std::vector<float> h_hist(N);
-  std::vector<unsigned int> rng_seeds(NUM_BLOCKS * THREADS_PER_BLOCK);
+  unsigned int seed = good_seed(time(NULL));
 
   //initialise cuda stuff
-  curandState *d_states;
+  curandStateMtgp32 *d_states;
+  mtgp32_kernel_params *d_kernel_params;
   unsigned int *d_local_hist;
   float *d_global_hist;
-  unsigned int *d_seeds;
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  //Generate the seeds
-  std::cout << "Generating Seeds" << std::endl;
-  for (int i = 0; i<rng_seeds.size(); i++) rng_seeds[i] = good_seed(i);
-
-  //allocate states and seeds and copy the seeds to the device
-  gpu_error_check(cudaMalloc((void **)&d_states,  NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(curandState)));
-  gpu_error_check(cudaMalloc(&d_seeds, NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(unsigned int)));
-  gpu_error_check(cudaMemcpy(rng_seeds.data(), d_seeds, NUM_BLOCKS * THREADS_PER_BLOCK * sizeof(unsigned int), cudaMemcpyDeviceToHost));
-
-  //Print out lauch params
-  std::cout << "launching " << NUM_BLOCKS << " blocks of " << THREADS_PER_BLOCK << " threads" << std::endl;
-
-  //initialise the rng states on the gpu
-  set_up_rngs <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> (d_states, d_seeds);
-  gpu_error_check(cudaPeekAtLastError());
-
-  //Free the seeds on the device
-  gpu_error_check(cudaFree(d_seeds));
-
-  //Allocate memory on the device for local and global histograms
+  //allocate device memory
+  gpu_error_check(cudaMalloc((void **)&d_states,  NUM_BLOCKS * sizeof(curandStateMtgp32)));
+  gpu_error_check(cudaMalloc((void **)&d_kernel_params, sizeof(mtgp32_kernel_params)));
   gpu_error_check(cudaMalloc(&d_local_hist, NUM_BLOCKS * N * sizeof(unsigned int)));
   gpu_error_check(cudaMalloc(&d_global_hist, N * sizeof(float)));
+
+  std::cout << "Setting up RNG states on the device" << std::endl;
+  CURAND_error_check(curandMakeMTGP32Constants(mtgp32dc_params_fast_11213, d_kernel_params));
+  CURAND_error_check(curandMakeMTGP32KernelState(d_states, mtgp32dc_params_fast_11213, d_kernel_params, NUM_BLOCKS, seed));
+
+  std::cout << "launching " << NUM_BLOCKS << " blocks of " << THREADS_PER_BLOCK << " threads" << std::endl;
 
   //Set the histograms to zero to start
   gpu_error_check(cudaMemset(d_local_hist, (unsigned int) 0, NUM_BLOCKS * N * sizeof(unsigned int)));
