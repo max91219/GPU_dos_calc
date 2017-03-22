@@ -4,7 +4,8 @@
  Author      : Max Howell
  Version     :
  Copyright   : 
- Description : CUDA compute reciprocals
+ Description : CUDA computation of non interacting density of states using
+ 	 	 	   Monte Carlo.
  ============================================================================
  */
 
